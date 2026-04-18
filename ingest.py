@@ -1,8 +1,9 @@
+import torch
 import os
 import re
 import chromadb
 from chromadb.config import Settings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from langchain_community.document_loaders import WebBaseLoader
 
@@ -57,15 +58,39 @@ def load_and_chunk_urls(urls: list[str]) -> list[dict]:
     return all_chunks
 
 
-def ingest(urls: list[str]) -> int:
-    """
-    Ingest documents from URLs into ChromaDB with cosine similarity.
+def chunk_pages(pages: dict[str, str]) -> list[dict]:
+    """Split pre-scraped pages into chunks with metadata."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
 
-    Returns:
-        int: Total number of chunks stored.
+    all_chunks = []
+    for url, content in pages.items():
+        cleaned = clean_text(content)
+        splits = splitter.split_text(cleaned)
+        for idx, split in enumerate(splits):
+            all_chunks.append({
+                "text": split,
+                "source": url,
+                "chunk_index": idx,
+                "word_count": len(split.split()),
+            })
+
+    return all_chunks
+
+
+def ingest(pages: dict[str, str], model: SentenceTransformer) -> int:
     """
-    print(f"[INFO] Loading and chunking {len(urls)} URL(s)...")
-    chunks = load_and_chunk_urls(urls)
+    Ingest documents into ChromaDB.
+    
+    Args:
+        pages: Dict of {url: text}
+        model: Pre-loaded SentenceTransformer model
+    """
+    print(f"[INFO] Chunking {len(pages)} page(s)...")
+    chunks = chunk_pages(pages)
 
     if not chunks:
         print("[ERROR] No chunks produced. Aborting ingestion.")
@@ -73,24 +98,19 @@ def ingest(urls: list[str]) -> int:
 
     print(f"[INFO] Total chunks to embed: {len(chunks)}")
 
-    # Load embedding model
-    print(f"[INFO] Loading embedding model: {EMBEDDING_MODEL}")
-    model = SentenceTransformer(EMBEDDING_MODEL)
-
-    # Batch encode all chunks in a single call
+    # Batch encode all chunks
     texts = [c["text"] for c in chunks]
-    print("[INFO] Encoding chunks (batch)...")
+    print("[INFO] Encoding chunks...")
     embeddings = model.encode(
         texts,
         batch_size=64,
         show_progress_bar=True,
-        normalize_embeddings=True,  # Required for cosine similarity with BGE
+        normalize_embeddings=True,
     )
 
-    # Set up ChromaDB with cosine similarity
+    # Set up ChromaDB
     client = chromadb.PersistentClient(path=CHROMA_PATH)
 
-    # Delete existing collection if it exists to avoid duplicates
     try:
         client.delete_collection(COLLECTION_NAME)
         print(f"[INFO] Deleted existing collection '{COLLECTION_NAME}'.")
@@ -102,7 +122,6 @@ def ingest(urls: list[str]) -> int:
         metadata={"hnsw:space": "cosine"},
     )
 
-    # Prepare data for upsert
     ids = [f"chunk_{i}" for i in range(len(chunks))]
     metadatas = [
         {
@@ -113,7 +132,6 @@ def ingest(urls: list[str]) -> int:
         for c in chunks
     ]
 
-    # Insert in batches to avoid memory issues
     batch_size = 500
     for start in range(0, len(chunks), batch_size):
         end = min(start + batch_size, len(chunks))
@@ -123,17 +141,16 @@ def ingest(urls: list[str]) -> int:
             documents=texts[start:end],
             metadatas=metadatas[start:end],
         )
-        print(f"[INFO] Stored chunks {start}–{end - 1}.")
 
-    total_stored = collection.count()
-    print(f"[SUCCESS] Ingestion complete. Total chunks stored: {total_stored}")
-    return total_stored
+    return collection.count()
 
 
 if __name__ == "__main__":
-    # Replace with your target URLs
-    TARGET_URLS = [
-        "https://example.com",
-    ]
-    total = ingest(TARGET_URLS)
+    # Simple test URLs
+    from sentence_transformers import SentenceTransformer
+    test_model = SentenceTransformer(EMBEDDING_MODEL)
+    test_pages = {
+        "https://example.com": "This is a test page content for the RAG chatbot to ingest."
+    }
+    total = ingest(test_pages, test_model)
     print(f"[DONE] {total} chunks in ChromaDB.")

@@ -7,6 +7,8 @@ returning a dict of {url: cleaned_text}.
 
 from collections import deque
 from urllib.parse import urljoin, urlparse, urlunparse
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import requests
 from bs4 import BeautifulSoup
@@ -65,62 +67,57 @@ def scrape(
     progress_callback=None,
 ) -> dict[str, str]:
     """
-    BFS-crawl *start_url* (same domain only).
-
-    Parameters
-    ----------
-    start_url : str
-        The seed URL to begin crawling.
-    max_pages : int
-        Maximum number of pages to fetch (default 50).
-    progress_callback : callable, optional
-        Called with (current_count, max_pages, url) after each successful page.
-
-    Returns
-    -------
-    dict[str, str]
-        Mapping of URL → cleaned body text (pages with <100 chars are dropped).
+    BFS-crawl *start_url* (same domain only) using a thread pool for speed.
     """
     start_url = _normalize_url(start_url)
     target_domain = urlparse(start_url).netloc.lower()
 
-    visited: set[str] = set()
+    visited: set[str] = {start_url}
     queue: deque[str] = deque([start_url])
     pages: dict[str, str] = {}
+    lock = threading.Lock()
+    session = requests.Session()
 
-    while queue and len(pages) < max_pages:
-        url = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
-
+    def _process_url(url: str):
         try:
-            resp = requests.get(url, headers=_HEADERS, timeout=8)
+            resp = session.get(url, headers=_HEADERS, timeout=8)
             resp.raise_for_status()
-            # Only process HTML responses
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" not in content_type:
-                continue
+            if "text/html" not in resp.headers.get("Content-Type", ""):
+                return
+            
+            text = _extract_text(resp.text)
+            if len(text) < 100:
+                return
+
+            with lock:
+                if len(pages) >= max_pages:
+                    return
+                pages[url] = text
+                count = len(pages)
+
+            if progress_callback:
+                progress_callback(count, max_pages, url)
+            print(f"Scraped {count}/{max_pages}: {url}")
+
+            new_links = _extract_links(resp.text, url, target_domain)
+            with lock:
+                for link in new_links:
+                    if link not in visited:
+                        visited.add(link)
+                        queue.append(link)
         except Exception:
-            # Network / HTTP errors — skip silently
-            continue
+            pass
 
-        text = _extract_text(resp.text)
-
-        # Skip thin pages (< 100 chars of real content)
-        if len(text) < 100:
-            continue
-
-        pages[url] = text
-        count = len(pages)
-
-        if progress_callback:
-            progress_callback(count, max_pages, url)
-        print(f"Scraped {count}/{max_pages}: {url}")
-
-        # Discover new links for BFS frontier
-        for link in _extract_links(resp.text, url, target_domain):
-            if link not in visited:
-                queue.append(link)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        while True:
+            with lock:
+                if not queue or len(pages) >= max_pages:
+                    break
+                batch = []
+                while queue and len(batch) < 10:
+                    batch.append(queue.popleft())
+            
+            if batch:
+                list(executor.map(_process_url, batch))
 
     return pages
