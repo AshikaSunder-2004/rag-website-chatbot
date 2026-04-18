@@ -1,3 +1,4 @@
+import torch
 import os
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -26,30 +27,28 @@ CONFIDENCE_MEDIUM = 0.30
 # ── Lazy-loaded globals ────────────────────────────────────────────────────────
 _embed_model: SentenceTransformer | None = None
 _reranker: CrossEncoder | None = None
-_chroma_collection = None
 _groq_client: Groq | None = None
 
 
 def _get_embed_model() -> SentenceTransformer:
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBEDDING_MODEL)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _embed_model = SentenceTransformer(EMBEDDING_MODEL, device=device)
     return _embed_model
 
 
 def _get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _reranker = CrossEncoder(RERANKER_MODEL, device=device)
     return _reranker
 
 
 def _get_collection():
-    global _chroma_collection
-    if _chroma_collection is None:
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
-        _chroma_collection = client.get_collection(COLLECTION_NAME)
-    return _chroma_collection
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    return client.get_collection(COLLECTION_NAME)
 
 
 def _get_groq() -> Groq:
@@ -183,9 +182,13 @@ def generate_answer(
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Append trimmed conversation history
+    # Append trimmed conversation history (only role and content)
     if chat_history:
-        messages.extend(chat_history[-MAX_HISTORY_MESSAGES:])
+        clean_history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in chat_history[-MAX_HISTORY_MESSAGES:]
+        ]
+        messages.extend(clean_history)
 
     messages.append({
         "role": "user",
@@ -213,6 +216,98 @@ def generate_answer(
     print()  # newline after streaming ends
 
     return full_answer
+
+
+def answer_stream(
+    user_query: str,
+    chat_history: list[dict] | None = None,
+    model: SentenceTransformer | None = None,
+):
+    """
+    Generator version of the query pipeline for streaming results in Streamlit.
+    Yields text tokens, then finally a dict containing metadata (sources, confidence).
+    """
+    if chat_history is None:
+        chat_history = []
+
+    # 1. Rewrite query for better retrieval
+    rewritten = rewrite_query(user_query, chat_history)
+
+    # 2. Retrieve top-K chunks
+    # Use the passed model if available, otherwise get the default one
+    if model:
+        prefixed_query = BGE_QUERY_PREFIX + rewritten
+        query_embedding = model.encode(prefixed_query, normalize_embeddings=True).tolist()
+        collection = _get_collection()
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=TOP_K,
+            include=["documents", "metadatas", "distances"],
+        )
+        chunks = []
+        for doc, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+            chunks.append({"text": doc, "source": meta.get("source", ""), "chunk_index": meta.get("chunk_index", -1), "distance": dist})
+    else:
+        chunks = retrieve(rewritten)
+    if not chunks:
+        yield "I couldn't find relevant information in the ingested pages to answer your question."
+        yield {"sources": [], "confidence": "low"}
+        return
+
+    # 3. Rerank with CrossEncoder
+    reranked = rerank(rewritten, chunks)
+
+    # 4. Compute confidence
+    confidence = compute_confidence(reranked)
+
+    # 5. Collect unique source URLs
+    source_urls = list(dict.fromkeys(c["source"] for c in reranked if c["source"]))
+
+    # 6. Generate streaming answer
+    context_text = "\n\n---\n\n".join(
+        f"[Source: {c['source']}]\n{c['text']}" for c in reranked
+    )
+
+    system_prompt = (
+        "You are a helpful, accurate assistant. "
+        "Answer the user's question using ONLY the provided context. "
+        "If the answer is not in the context, say you don't know. "
+        "Be concise and cite sources where relevant."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    # Append trimmed conversation history (only role and content)
+    if chat_history:
+        clean_history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in chat_history[-MAX_HISTORY_MESSAGES:]
+        ]
+        messages.extend(clean_history)
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"Context:\n{context_text}\n\n"
+            f"Question: {user_query}"
+        ),
+    })
+
+    groq = _get_groq()
+    completion_stream = groq.chat.completions.create(
+        model=ANSWER_MODEL,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=1024,
+        stream=True,
+    )
+
+    for chunk in completion_stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+    # Yield metadata at the end
+    yield {"sources": source_urls, "confidence": confidence}
 
 
 # ── Public Interface ───────────────────────────────────────────────────────────
